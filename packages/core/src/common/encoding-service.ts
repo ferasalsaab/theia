@@ -46,6 +46,11 @@ export interface DetectedEncoding {
     seemsBinary?: boolean
 }
 
+export interface DecodeStreamResult {
+    stream: ReadableStream<string>;
+    detected: DetectedEncoding;
+}
+
 @injectable()
 export class EncodingService {
 

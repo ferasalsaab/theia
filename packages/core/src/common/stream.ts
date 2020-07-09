@@ -91,8 +91,14 @@ export interface WriteableStream<T> extends ReadableStream<T> {
 	 * Writing data to the stream will trigger the on('data')
 	 * event listener if the stream is flowing and buffer the
 	 * data otherwise until the stream is flowing.
+	 *
+	 * If a `highWaterMark` is configured and writing to the
+	 * stream reaches this mark, a promise will be returned
+	 * that should be awaited on before writing more data.
+	 * Otherwise there is a risk of buffering a large number
+	 * of data chunks without consumer.
 	 */
-    write(data: T): void;
+    write(data: T): void | Promise<void>;
 
 	/**
 	 * Signals an error to the consumer of the stream via the
@@ -118,24 +124,24 @@ export function isReadableStream<T>(obj: unknown): obj is ReadableStream<T> {
     return candidate && [candidate.on, candidate.pause, candidate.resume, candidate.destroy].every(fn => typeof fn === 'function');
 }
 
-export interface IReducer<T> {
+export interface Reducer<T> {
     (data: T[]): T;
 }
 
-export interface IDataTransformer<Original, Transformed> {
+export interface DataTransformer<Original, Transformed> {
     (data: Original): Transformed;
 }
 
-export interface IErrorTransformer {
+export interface ErrorTransformer {
     (error: Error): Error;
 }
 
 export interface ITransformer<Original, Transformed> {
-    data: IDataTransformer<Original, Transformed>;
-    error?: IErrorTransformer;
+    data: DataTransformer<Original, Transformed>;
+    error?: ErrorTransformer;
 }
 
-export function newWriteableStream<T>(reducer: IReducer<T>): WriteableStream<T> {
+export function newWriteableStream<T>(reducer: Reducer<T>): WriteableStream<T> {
     return new WriteableStreamImpl<T>(reducer);
 }
 
@@ -158,7 +164,7 @@ class WriteableStreamImpl<T> implements WriteableStream<T> {
         end: [] as { (): void }[]
     };
 
-    constructor(private reducer: IReducer<T>) { }
+    constructor(private reducer: Reducer<T>) { }
 
     pause(): void {
         if (this.state.destroyed) {
@@ -332,7 +338,7 @@ class WriteableStreamImpl<T> implements WriteableStream<T> {
 /**
  * Helper to fully read a T readable into a T.
  */
-export function consumeReadable<T>(readable: Readable<T>, reducer: IReducer<T>): T {
+export function consumeReadable<T>(readable: Readable<T>, reducer: Reducer<T>): T {
     const chunks: T[] = [];
 
     let chunk: T | null;
@@ -348,7 +354,7 @@ export function consumeReadable<T>(readable: Readable<T>, reducer: IReducer<T>):
  * reached, will return a readable instead to ensure all data can still
  * be read.
  */
-export function consumeReadableWithLimit<T>(readable: Readable<T>, reducer: IReducer<T>, maxChunks: number): T | Readable<T> {
+export function consumeReadableWithLimit<T>(readable: Readable<T>, reducer: Reducer<T>, maxChunks: number): T | Readable<T> {
     const chunks: T[] = [];
 
     let chunk: T | null | undefined = undefined;
@@ -394,7 +400,7 @@ export function consumeReadableWithLimit<T>(readable: Readable<T>, reducer: IRed
 /**
  * Helper to fully read a T stream into a T.
  */
-export function consumeStream<T>(stream: ReadableStream<T>, reducer: IReducer<T>): Promise<T> {
+export function consumeStream<T>(stream: ReadableStream<T>, reducer: Reducer<T>): Promise<T> {
     return new Promise((resolve, reject) => {
         const chunks: T[] = [];
 
@@ -409,7 +415,7 @@ export function consumeStream<T>(stream: ReadableStream<T>, reducer: IReducer<T>
  * reached, will return a stream instead to ensure all data can still
  * be read.
  */
-export function consumeStreamWithLimit<T>(stream: ReadableStream<T>, reducer: IReducer<T>, maxChunks: number): Promise<T | ReadableStream<T>> {
+export function consumeStreamWithLimit<T>(stream: ReadableStream<T>, reducer: Reducer<T>, maxChunks: number): Promise<T | ReadableStream<T>> {
     return new Promise((resolve, reject) => {
         const chunks: T[] = [];
 
@@ -463,7 +469,7 @@ export function consumeStreamWithLimit<T>(stream: ReadableStream<T>, reducer: IR
 /**
  * Helper to create a readable stream from an existing T.
  */
-export function toStream<T>(t: T, reducer: IReducer<T>): ReadableStream<T> {
+export function toStream<T>(t: T, reducer: Reducer<T>): ReadableStream<T> {
     const stream = newWriteableStream<T>(reducer);
 
     stream.end(t);
@@ -493,7 +499,7 @@ export function toReadable<T>(t: T): Readable<T> {
 /**
  * Helper to transform a readable stream into another stream.
  */
-export function transform<Original, Transformed>(stream: ReadableStreamEvents<Original>, transformer: ITransformer<Original, Transformed>, reducer: IReducer<Transformed>): ReadableStream<Transformed> {
+export function transform<Original, Transformed>(stream: ReadableStreamEvents<Original>, transformer: ITransformer<Original, Transformed>, reducer: Reducer<Transformed>): ReadableStream<Transformed> {
     const target = newWriteableStream<Transformed>(reducer);
 
     stream.on('data', data => target.write(transformer.data(data)));

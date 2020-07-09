@@ -50,11 +50,12 @@ import {
     Stat, WatchOptions, WriteFileOptions,
     toFileOperationResult, toFileSystemProviderErrorCode,
     ResolveFileResult, ResolveFileResultWithMetadata,
-    MoveFileOptions, CopyFileOptions, BaseStatWithMetadata, FileDeleteOptions, FileOperationOptions, hasAccessCapability, hasUpdateCapability
+    MoveFileOptions, CopyFileOptions, BaseStatWithMetadata, FileDeleteOptions, FileOperationOptions, hasAccessCapability, hasUpdateCapability,
+    hasFileReadStreamCapability, FileSystemProviderWithFileReadStreamCapability
 } from '../common/files';
 import { createReadStream } from '../common/io';
 import { BinaryBuffer, BinaryBufferReadable, BinaryBufferReadableStream } from '@theia/core/lib/common/buffer';
-import { isReadableStream, ReadableStreamEvents, transform, consumeStreamWithLimit, consumeReadableWithLimit } from '@theia/core/lib/common/stream';
+import { isReadableStream, ReadableStreamEvents, transform, consumeStreamWithLimit, consumeReadableWithLimit, consumeStream } from '@theia/core/lib/common/stream';
 import { LabelProvider } from '@theia/core/lib/browser/label-provider';
 import { FileSystemPreferences } from './filesystem-preferences';
 import { ProgressService } from '@theia/core/lib/common/progress-service';
@@ -115,17 +116,28 @@ export interface ReadTextFileOptions extends ReadEncodingOptions, ReadFileOption
     acceptTextOnly?: boolean;
 }
 
-export interface TextFileContent extends BaseStatWithMetadata {
+interface BaseTextFileContent extends BaseStatWithMetadata {
 
-    /**
-     * The encoding of the content if known.
-     */
+	/**
+	 * The encoding of the content if known.
+	 */
     encoding: string;
+}
+
+export interface TextFileContent extends BaseTextFileContent {
 
 	/**
 	 * The content of a text file.
 	 */
     value: string;
+}
+
+export interface TextFileStreamContent extends BaseTextFileContent {
+
+	/**
+	 * The line grouped content of a text file.
+	 */
+    value: ReadableStream<string>;
 }
 
 export interface CreateTextFileOptions extends WriteEncodingOptions, CreateFileOptions { }
@@ -566,16 +578,59 @@ export class FileService {
     }
 
     async read(resource: URI, options?: ReadTextFileOptions): Promise<TextFileContent> {
+        const [bufferStream, decoder] = await this.doRead(resource, {
+            ...options,
+            // optimization: since we know that the caller does not
+            // care about buffering, we indicate this to the reader.
+            // this reduces all the overhead the buffered reading
+            // has (open, read, close) if the provider supports
+            // unbuffered reading.
+            preferUnbuffered: true
+        });
+
+        return {
+            ...bufferStream,
+            encoding: decoder.detected.encoding || UTF8,
+            value: await consumeStream(decoder.stream, strings => strings.join(''))
+        };
+    }
+
+    async readStream(resource: URI, options?: ReadTextFileOptions): Promise<TextFileStreamContent> {
+        const [bufferStream, decoder] = await this.doRead(resource, options);
+
+        return {
+            ...bufferStream,
+            encoding: decoder.detected.encoding || UTF8,
+            value: decoder.stream
+        };
+    }
+
+    private async doRead(resource: URI, options?: ReadTextFileOptions & { preferUnbuffered?: boolean }): Promise<[FileStreamContent, DecodeStreamResult]> {
         options = this.resolveReadOptions(options);
-        const content = await this.readFile(resource, options);
-        // TODO stream
-        const detected = await this.encodingService.detectEncoding(content.value, options.autoGuessEncoding);
-        if (options?.acceptTextOnly && detected.seemsBinary) {
+
+        // read stream raw (either buffered or unbuffered)
+        let bufferStream: FileStreamContent;
+        if (options?.preferUnbuffered) {
+            const content = await this.readFile(resource, options);
+            bufferStream = {
+                ...content,
+                value: bufferToStream(content.value)
+            };
+        } else {
+            bufferStream = await this.readFileStream(resource, options);
+        }
+
+        const decoder = await toDecodeStream(bufferStream.value, {
+            guessEncoding: options.autoGuessEncoding,
+            overwriteEncoding: detectedEncoding => this.getReadEncoding(resource, options, detectedEncoding)
+        });
+
+        // validate binary
+        if (options?.acceptTextOnly && decoder.detected.seemsBinary) {
             throw new TextFileOperationError('File seems to be binary and cannot be opened as text', TextFileOperationResult.FILE_IS_BINARY, options);
         }
-        const encoding = await this.getReadEncoding(resource, options, detected.encoding);
-        const value = this.encodingService.decode(content.value, encoding);
-        return { ...content, encoding, value };
+
+        return [bufferStream, decoder];
     }
 
     protected resolveReadOptions(options?: ReadTextFileOptions): ReadTextFileOptions {
@@ -647,22 +702,30 @@ export class FileService {
             // to write is a Readable, we consume up to 3 chunks and try to write the data
             // unbuffered to reduce the overhead. If the Readable has more data to provide
             // we continue to write buffered.
+            let bufferOrReadableOrStreamOrBufferedStream: BinaryBuffer | BinaryBufferReadable | BinaryBufferReadableStream | BinaryBufferReadableBufferedStream;
             if (hasReadWriteCapability(provider) && !(bufferOrReadableOrStream instanceof BinaryBuffer)) {
                 if (isReadableStream(bufferOrReadableOrStream)) {
-                    bufferOrReadableOrStream = await consumeStreamWithLimit(bufferOrReadableOrStream, data => BinaryBuffer.concat(data), 3);
+                    const bufferedStream = await peekStream(bufferOrReadableOrStream, 3);
+                    if (bufferedStream.ended) {
+                        bufferOrReadableOrStreamOrBufferedStream = BinaryBuffer.concat(bufferedStream.buffer);
+                    } else {
+                        bufferOrReadableOrStreamOrBufferedStream = bufferedStream;
+                    }
                 } else {
-                    bufferOrReadableOrStream = consumeReadableWithLimit(bufferOrReadableOrStream, data => BinaryBuffer.concat(data), 3);
+                    bufferOrReadableOrStreamOrBufferedStream = peekReadable(bufferOrReadableOrStream, data => BinaryBuffer.concat(data), 3);
                 }
+            } else {
+                bufferOrReadableOrStreamOrBufferedStream = bufferOrReadableOrStream;
             }
 
             // write file: unbuffered (only if data to write is a buffer, or the provider has no buffered write capability)
-            if (!hasOpenReadWriteCloseCapability(provider) || (hasReadWriteCapability(provider) && bufferOrReadableOrStream instanceof BinaryBuffer)) {
-                await this.doWriteUnbuffered(provider, resource, bufferOrReadableOrStream);
+            if (!hasOpenReadWriteCloseCapability(provider) || (hasReadWriteCapability(provider) && bufferOrReadableOrStreamOrBufferedStream instanceof BinaryBuffer)) {
+                await this.doWriteUnbuffered(provider, resource, bufferOrReadableOrStreamOrBufferedStream);
             }
 
             // write file: buffered
             else {
-                await this.doWriteBuffered(provider, resource, bufferOrReadableOrStream instanceof BinaryBuffer ? BinaryBufferReadable.fromBuffer(bufferOrReadableOrStream) : bufferOrReadableOrStream);
+                await this.doWriteBuffered(provider, resource, bufferOrReadableOrStreamOrBufferedStream instanceof BinaryBuffer ? bufferToReadable(bufferOrReadableOrStreamOrBufferedStream) : bufferOrReadableOrStreamOrBufferedStream);
             }
         } catch (error) {
             this.rethrowAsFileOperationError('Unable to write file', resource, error, options);
@@ -764,9 +827,15 @@ export class FileService {
             let fileStreamPromise: Promise<BinaryBufferReadableStream>;
 
             // read unbuffered (only if either preferred, or the provider has no buffered read capability)
-            if (!hasOpenReadWriteCloseCapability(provider) || (hasReadWriteCapability(provider) && options?.preferUnbuffered)) {
+            if (!(hasOpenReadWriteCloseCapability(provider) || hasFileReadStreamCapability(provider)) || (hasReadWriteCapability(provider) && options?.preferUnbuffered)) {
                 fileStreamPromise = this.readFileUnbuffered(provider, resource, options);
             }
+
+            // read streamed (always prefer over primitive buffered read)
+            else if (hasFileReadStreamCapability(provider)) {
+                fileStreamPromise = Promise.resolve(this.readFileStreamed(provider, resource, cancellableSource.token, options));
+            }
+
             // read buffered
             else {
                 fileStreamPromise = Promise.resolve(this.readFileBuffered(provider, resource, cancellableSource.token, options));
@@ -807,6 +876,15 @@ export class FileService {
             toFileOperationResult(error), options);
         fileOperationError.stack = `${fileOperationError.stack}\nCaused by: ${error.stack}`;
         return fileOperationError;
+    }
+
+    private readFileStreamed(provider: FileSystemProviderWithFileReadStreamCapability, resource: URI, token: CancellationToken, options: ReadFileOptions = Object.create(null)): BinaryBufferReadableStream {
+        const fileStream = provider.readFileStream(resource, options, token);
+
+        return transform(fileStream, {
+            data: data => data instanceof BinaryBuffer ? data : BinaryBuffer.wrap(data),
+            error: error => this.asFileOperationError('Unable to read file', resource, error, options)
+        }, data => BinaryBuffer.concat(data));
     }
 
     private async readFileUnbuffered(provider: FileSystemProviderWithFileReadWriteCapability, resource: URI, options?: ReadFileOptions): Promise<BinaryBufferReadableStream> {
